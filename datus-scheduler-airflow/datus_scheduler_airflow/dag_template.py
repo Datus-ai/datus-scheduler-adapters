@@ -102,9 +102,18 @@ _DAG_TEMPLATE = textwrap.dedent(
             # DuckDB: Airflow round-trips the URI through component parsing,
             # which can corrupt "duckdb:///path".  Rebuild from conn fields.
             if conn.conn_type == "duckdb":
-                db_path = (conn.schema or conn.host or "").lstrip("/")
-                # 4 slashes = absolute path (same convention as SQLite)
-                url = "duckdb:////" + db_path
+                db_path = conn.schema or conn.host or ""
+                if db_path == ":memory:":
+                    url = "duckdb:///:memory:"
+                elif db_path.startswith("/"):
+                    url = "duckdb:///" + db_path      # absolute: duckdb:////abs/path
+                else:
+                    url = "duckdb:///" + db_path       # relative: duckdb:///local.db
+                # Preserve query parameters from Airflow extras
+                query_params = conn.extra_dejson if hasattr(conn, "extra_dejson") else {{}}
+                if query_params:
+                    qs = "&".join(k + "=" + str(v) for k, v in query_params.items())
+                    url = url + "?" + qs
                 print("[Datus] Using Airflow connection: " + conn_id + " (duckdb)")
                 return url
             url = conn.get_uri()
