@@ -4,7 +4,9 @@
 """Unit tests for datus-airflow adapter (no live Airflow required)."""
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -583,3 +585,167 @@ class TestSparkSqlDagTemplate:
             end_date=end,
         )
         assert "2025" in source and "12" in source and "31" in source
+
+
+class TestDuckDBDagTemplate:
+    """Tests for DuckDB connection handling in the rendered DAG template."""
+
+    def test_rendered_source_contains_duckdb_branch(self) -> None:
+        source = render_dag_source(
+            dag_id="duckdb_dag", job_name="DuckDB Job", sql="SELECT 1",
+            db_connection={"conn_id": "my_duckdb"},
+            schedule=None, start_date=None, end_date=None, description=None,
+        )
+        assert 'conn.conn_type == "duckdb"' in source
+        assert "extra_dejson" in source
+
+    def test_duckdb_conn_id_embedded(self) -> None:
+        source = render_dag_source(
+            dag_id="d", job_name="d", sql="SELECT 1",
+            db_connection={"conn_id": "duckdb_dacomp_lever"},
+            schedule=None, start_date=None, end_date=None, description=None,
+        )
+        assert "duckdb_dacomp_lever" in source
+
+    @staticmethod
+    def _call_resolve_url(conn_attrs: dict) -> str:
+        """Render DAG, exec with mocked Airflow, and call _resolve_connection_url."""
+        source = render_dag_source(
+            dag_id="test", job_name="test", sql="SELECT 1",
+            db_connection={"conn_id": "test_conn"},
+            schedule=None, start_date=None, end_date=None, description=None,
+        )
+        conn_obj = SimpleNamespace(**conn_attrs)
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn_obj
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            return ns["_resolve_connection_url"]({"conn_id": "test_conn"})
+
+    def test_duckdb_absolute_path(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": "",
+            "host": "/opt/airflow/data/foo.duckdb", "extra_dejson": {},
+        })
+        assert url == "duckdb:////opt/airflow/data/foo.duckdb"
+
+    def test_duckdb_relative_path(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": "local.db",
+            "host": "", "extra_dejson": {},
+        })
+        assert url == "duckdb:///local.db"
+
+    def test_duckdb_memory(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": ":memory:",
+            "host": "", "extra_dejson": {},
+        })
+        assert url == "duckdb:///:memory:"
+
+    def test_duckdb_query_params_preserved(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": "",
+            "host": "/opt/airflow/data/foo.duckdb",
+            "extra_dejson": {"read_only": "true"},
+        })
+        assert url == "duckdb:////opt/airflow/data/foo.duckdb?read_only=true"
+
+    def test_duckdb_multiple_query_params(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": "",
+            "host": "/opt/airflow/data/foo.duckdb",
+            "extra_dejson": {"read_only": "true", "threads": "4"},
+        })
+        assert "duckdb:////opt/airflow/data/foo.duckdb?" in url
+        assert "read_only=true" in url
+        assert "threads=4" in url
+
+    def test_duckdb_no_query_params_no_question_mark(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": "",
+            "host": "/opt/airflow/data/foo.duckdb", "extra_dejson": {},
+        })
+        assert "?" not in url
+
+    def test_duckdb_schema_takes_priority_over_host(self) -> None:
+        url = self._call_resolve_url({
+            "conn_type": "duckdb",
+            "schema": "/data/primary.duckdb",
+            "host": "/data/secondary.duckdb",
+            "extra_dejson": {},
+        })
+        assert url == "duckdb:////data/primary.duckdb"
+
+    def test_duckdb_empty_path_raises(self) -> None:
+        """Empty schema and host should raise, not produce ambiguous duckdb:///."""
+        with pytest.raises(ValueError, match="no database path"):
+            self._call_resolve_url({
+                "conn_type": "duckdb", "schema": "",
+                "host": "", "extra_dejson": {},
+            })
+
+    def test_duckdb_query_params_special_chars_encoded(self) -> None:
+        """Reserved characters in extras must be percent-encoded."""
+        url = self._call_resolve_url({
+            "conn_type": "duckdb", "schema": "",
+            "host": "/data/foo.duckdb",
+            "extra_dejson": {"path": "/tmp/a b", "filter": "x=1&y=2"},
+        })
+        assert "duckdb:////data/foo.duckdb?" in url
+        # Values must be percent-encoded, not raw
+        assert "a b" not in url        # space must be encoded
+        assert "x=1&y=2" not in url    # raw & must be encoded
+        from urllib.parse import parse_qs, urlparse
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        assert params["path"] == ["/tmp/a b"]
+        assert params["filter"] == ["x=1&y=2"]
+
+    @staticmethod
+    def _call_resolve_url_with_conn(conn_obj) -> str:
+        """Like _call_resolve_url but accepts a pre-built conn object."""
+        source = render_dag_source(
+            dag_id="test", job_name="test", sql="SELECT 1",
+            db_connection={"conn_id": "test_conn"},
+            schedule=None, start_date=None, end_date=None, description=None,
+        )
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn_obj
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            return ns["_resolve_connection_url"]({"conn_id": "test_conn"})
+
+    def test_postgres_connection_normalized(self) -> None:
+        """Non-DuckDB path: postgres:// must be normalized to postgresql://."""
+        conn = MagicMock()
+        conn.conn_type = "postgres"
+        conn.get_uri.return_value = "postgres://user:pass@host:5432/mydb"
+        url = self._call_resolve_url_with_conn(conn)
+        assert url == "postgresql://user:pass@host:5432/mydb"
+
+    def test_mysql_connection_passthrough(self) -> None:
+        """Non-DuckDB, non-postgres connections pass through unchanged."""
+        conn = MagicMock()
+        conn.conn_type = "mysql"
+        conn.get_uri.return_value = "mysql://user:pass@host:3306/mydb"
+        url = self._call_resolve_url_with_conn(conn)
+        assert url == "mysql://user:pass@host:3306/mydb"
