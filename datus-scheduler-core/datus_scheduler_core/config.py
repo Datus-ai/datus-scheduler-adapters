@@ -122,6 +122,19 @@ class AirflowConfig(SchedulerConnectionConfig):
         if self.project_name is not None and not _PROJECT_NAME_RE.match(self.project_name):
             raise ValueError(f"AirflowConfig.project_name {self.project_name!r} must match {_PROJECT_NAME_RE.pattern}.")
 
+        # Even though the regex allows '.' and '-', path traversal via '.', '..'
+        # or '..foo' would escape dags_folder_root when joined. Reject these
+        # explicitly rather than relying on later Path normalization.
+        if self.project_name is not None and (
+            self.project_name in (".", "..")
+            or self.project_name.startswith(".")
+            or ".." in self.project_name
+        ):
+            raise ValueError(
+                f"AirflowConfig.project_name {self.project_name!r} is not allowed: "
+                "must not be '.', '..', start with '.', or contain '..'."
+            )
+
         if self.dag_id_prefix is not None and not _DAG_ID_PREFIX_RE.match(self.dag_id_prefix):
             raise ValueError(
                 f"AirflowConfig.dag_id_prefix {self.dag_id_prefix!r} must match {_DAG_ID_PREFIX_RE.pattern}."

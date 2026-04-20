@@ -921,6 +921,18 @@ class TestAirflowConfigMultiTenant:
                 )
             )
 
+    @pytest.mark.parametrize("bad", [".", "..", "...", "..foo", ".hidden", "foo..bar"])
+    def test_project_name_rejects_path_traversal(self, tmp_path: Path, bad: str) -> None:
+        """project_name is joined to dags_folder_root via Path; '.', '..', and
+        any '..' substring could escape the intended tenant directory."""
+        with pytest.raises(ValueError, match="project_name"):
+            AirflowConfig(
+                **self._base_kwargs(
+                    dags_folder_root=str(tmp_path),
+                    project_name=bad,
+                )
+            )
+
     def test_invalid_dag_id_prefix_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="dag_id_prefix"):
             AirflowConfig(
@@ -956,7 +968,14 @@ class TestAdapterMultiTenant:
         assert (root / "team-a").is_dir()
 
     def test_init_fails_when_path_not_writable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """If mkdir succeeds but os.access reports not writable, raise."""
+        """mkdir succeeds but the actual write probe fails -> fail fast.
+
+        Simulates a read-only NFS / JuiceFS mount where directory creation
+        may succeed (via server permissions) but creating a file inside
+        raises PermissionError. We target the probe's write_text call rather
+        than os.access because os.access is advisory on networked filesystems
+        and the adapter no longer relies on it.
+        """
         from datus_scheduler_core.exceptions import SchedulerConnectionError
 
         cfg = AirflowConfig(
@@ -967,13 +986,16 @@ class TestAdapterMultiTenant:
             password="admin",
             dags_folder=str(tmp_path),
         )
-        # Simulate a read-only mount by intercepting os.access at the symbol
-        # used by adapter.py. Using the dotted-path form keeps the patch
-        # resilient against import-style refactors in the module.
-        def fake_access(path: object, mode: int) -> bool:
-            return False
 
-        monkeypatch.setattr("datus_scheduler_airflow.adapter.os.access", fake_access)
+        real_write_text = Path.write_text
+
+        def fake_write_text(self: Path, *args: object, **kwargs: object) -> int:
+            # Intercept only the probe, leave everything else alone.
+            if self.name.startswith(".datus_write_probe_"):
+                raise PermissionError("simulated read-only mount")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr("pathlib.Path.write_text", fake_write_text)
         with pytest.raises(SchedulerConnectionError, match="not writable"):
             self._make_adapter(cfg)
 
@@ -1024,9 +1046,45 @@ class TestAdapterMultiTenant:
         returned_ids = {j.job_id for j in jobs}
         assert returned_ids == {"team_a__foo", "team_a__bar"}
 
-        # Adapter should have asked Airflow to narrow server-side too
+        # dag_id_pattern is NOT sent to the server because Airflow interprets
+        # it as a SQL LIKE expression (underscores are wildcards), which
+        # would leak other tenants' DAGs whose names happen to match the
+        # resulting pattern. All filtering happens client-side.
         call_kwargs = adp._session.get.call_args.kwargs
-        assert call_kwargs["params"]["dag_id_pattern"] == "team_a__"
+        assert "dag_id_pattern" not in call_kwargs["params"]
+
+    def test_list_jobs_does_not_leak_on_sql_like_wildcard(self, tmp_path: Path) -> None:
+        """Regression: a DAG whose id matches the prefix's SQL LIKE expansion
+        (where ``_`` is a single-char wildcard) but not the intended literal
+        prefix must NOT be returned. With the old server-side filter the
+        server would happily return ``teamXaXXfoo`` for pattern ``team_a__``.
+        """
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder_root=str(tmp_path),
+            project_name="team-a",
+        )
+        adp = self._make_adapter(cfg)
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "dags": [
+                {"dag_id": "team_a__legit", "is_paused": False},
+                # These all match "team_a__" as a SQL LIKE pattern because _ is a wildcard:
+                {"dag_id": "teamXaXXfoo", "is_paused": False},
+                {"dag_id": "team1a23bar", "is_paused": False},
+            ]
+        }
+        adp._session.get.return_value = resp
+
+        jobs = adp.list_jobs()
+
+        assert {j.job_id for j in jobs} == {"team_a__legit"}
 
     def test_list_jobs_no_prefix_filter_in_legacy_mode(self, tmp_path: Path) -> None:
         """Legacy dags_folder-only config should not filter list_jobs."""

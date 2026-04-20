@@ -115,8 +115,26 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
             ) from exc
         except OSError as exc:
             raise SchedulerConnectionError(f"Cannot create dags_folder '{path}': {exc}") from exc
-        if not os.access(path, os.W_OK):
-            raise SchedulerConnectionError(f"dags_folder '{path}' is not writable by the current process.")
+
+        # os.access is advisory on NFS / JuiceFS and can lie in either
+        # direction. Perform a real write probe so a misconfigured mount
+        # fails loudly at boot. The probe name starts with a dot so it is
+        # invisible to Airflow's DAG scanner even if cleanup is interrupted.
+        probe = path / f".datus_write_probe_{os.getpid()}"
+        try:
+            probe.write_text("")
+        except OSError as exc:
+            raise SchedulerConnectionError(
+                f"dags_folder '{path}' is not writable by the current process: {exc}"
+            ) from exc
+        finally:
+            try:
+                probe.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Failed to clean up write probe %s: %s", probe, exc)
+
         logger.info(
             "Airflow adapter ready: dags_folder=%s, project_name=%r, dag_id_prefix=%r",
             path,
@@ -527,6 +545,11 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         resp.raise_for_status()
         return self._build_scheduled_job(resp.json())
 
+    # Page size used when paginating /dags server-side in multi-tenant mode.
+    # Kept moderately large so a typical Airflow cluster needs only one or two
+    # round-trips to cover all DAGs.
+    _LIST_SCAN_PAGE_SIZE = 100
+
     def list_jobs(
         self,
         project: Optional[str] = None,  # Airflow has no native project concept; ignored
@@ -537,29 +560,63 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         """List DAGs registered in Airflow.
 
         When ``config.dag_id_prefix`` is set (multi-tenant mode), results are
-        filtered to DAGs owned by this Datus instance. Airflow's
-        ``dag_id_pattern`` query parameter does substring matching, so we
-        combine server-side narrowing with client-side ``startswith`` to
-        avoid accidentally returning another tenant's DAG whose name happens
-        to contain this instance's prefix somewhere in the middle.
+        filtered to DAGs owned by this Datus instance.
+
+        We deliberately do NOT push the prefix to Airflow's ``dag_id_pattern``
+        query parameter: Airflow interprets it as a SQL LIKE expression, where
+        ``_`` is a single-character wildcard and ``%`` is a multi-character
+        wildcard. Our prefixes routinely contain underscores
+        (e.g. ``team_a__``), which would match unrelated DAGs server-side and
+        quietly leak other tenants' work across instance boundaries. Airflow
+        offers no documented ``ESCAPE`` clause via the REST API, so the only
+        correct solution is to filter client-side.
+
+        To preserve ``limit``/``offset`` semantics when the prefix filter
+        removes many DAGs, we paginate through Airflow until we have collected
+        enough matches (or exhausted the server).
         """
-        params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        if status == JobStatus.PAUSED:
-            params["only_active"] = "false"
-
         prefix = self._config.dag_id_prefix or ""
-        if prefix:
-            params["dag_id_pattern"] = prefix
 
-        resp = self._session.get("/dags", params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        if not prefix:
+            # Single-tenant / legacy mode: trust the server's pagination.
+            params: Dict[str, Any] = {"limit": limit, "offset": offset}
+            if status == JobStatus.PAUSED:
+                params["only_active"] = "false"
+            resp = self._session.get("/dags", params=params)
+            resp.raise_for_status()
+            jobs = [self._build_scheduled_job(d) for d in resp.json().get("dags", [])]
+            if status is not None:
+                jobs = [j for j in jobs if j.status == status]
+            return jobs
 
-        raw_dags = data.get("dags", [])
-        if prefix:
-            raw_dags = [d for d in raw_dags if d.get("dag_id", "").startswith(prefix)]
+        # Multi-tenant mode: paginate through all DAGs and apply prefix
+        # filtering client-side. Apply the caller's offset/limit to the
+        # filtered view so semantics match the single-tenant branch.
+        matched: List[dict] = []
+        scan_offset = 0
+        while True:
+            params = {"limit": self._LIST_SCAN_PAGE_SIZE, "offset": scan_offset}
+            if status == JobStatus.PAUSED:
+                params["only_active"] = "false"
+            resp = self._session.get("/dags", params=params)
+            resp.raise_for_status()
+            page = resp.json().get("dags", [])
+            if not page:
+                break
+            for d in page:
+                if d.get("dag_id", "").startswith(prefix):
+                    matched.append(d)
+            # Stop when the server returned a short page — no more DAGs.
+            if len(page) < self._LIST_SCAN_PAGE_SIZE:
+                break
+            # Cap the scan once we have more than enough to satisfy offset+limit,
+            # leaving some buffer for the caller to page deeper on the next call.
+            if len(matched) >= offset + limit:
+                break
+            scan_offset += self._LIST_SCAN_PAGE_SIZE
 
-        jobs = [self._build_scheduled_job(d) for d in raw_dags]
+        sliced = matched[offset : offset + limit]
+        jobs = [self._build_scheduled_job(d) for d in sliced]
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
         return jobs
