@@ -3,14 +3,12 @@
 
 """Unit tests for datus-airflow adapter (no live Airflow required)."""
 
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from datus_scheduler_airflow.adapter import AirflowSchedulerAdapter, _map_run_status
 from datus_scheduler_airflow.dag_template import render_dag_source, render_spark_dag_source, render_sparksql_dag_source
 from datus_scheduler_core.config import AirflowConfig
@@ -19,7 +17,6 @@ from datus_scheduler_core.exceptions import (
     SchedulerJobNotFoundError,
 )
 from datus_scheduler_core.models import JobStatus, RunStatus, SchedulerJobPayload
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -105,35 +102,55 @@ class TestDagTemplate:
 
     def test_none_schedule_renders_none(self) -> None:
         source = render_dag_source(
-            dag_id="d", job_name="d", sql="SELECT 1",
-            db_connection=None, schedule=None, start_date=None,
-            end_date=None, description=None,
+            dag_id="d",
+            job_name="d",
+            sql="SELECT 1",
+            db_connection=None,
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         assert "schedule=None" in source
 
     def test_string_none_schedule_renders_none(self) -> None:
         """LLM may pass the string 'None' instead of Python None; must still render schedule=None."""
         source = render_dag_source(
-            dag_id="d", job_name="d", sql="SELECT 1",
-            db_connection=None, schedule="None", start_date=None,
-            end_date=None, description=None,
+            dag_id="d",
+            job_name="d",
+            sql="SELECT 1",
+            db_connection=None,
+            schedule="None",
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         assert "schedule=None" in source
         assert "schedule='None'" not in source
 
     def test_cron_schedule_quoted(self) -> None:
         source = render_dag_source(
-            dag_id="d", job_name="d", sql="SELECT 1",
-            db_connection=None, schedule="0 6 * * 1",
-            start_date=None, end_date=None, description=None,
+            dag_id="d",
+            job_name="d",
+            sql="SELECT 1",
+            db_connection=None,
+            schedule="0 6 * * 1",
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         assert "'0 6 * * 1'" in source or '"0 6 * * 1"' in source
 
     def test_no_db_connection_renders_empty_dict(self) -> None:
         source = render_dag_source(
-            dag_id="d", job_name="d", sql="SELECT 1",
-            db_connection=None, schedule=None, start_date=None,
-            end_date=None, description=None,
+            dag_id="d",
+            job_name="d",
+            sql="SELECT 1",
+            db_connection=None,
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         assert '"db_connection": {}' in source
 
@@ -142,25 +159,34 @@ class TestDagTemplate:
 
 
 class TestDagId:
-    @pytest.mark.parametrize("name,expected", [
-        ("Daily Report", "daily_report"),
-        ("my-job-name", "my_job_name"),
-        ("UPPER CASE", "upper_case"),
-        ("already_valid", "already_valid"),
-    ])
-    def test_to_dag_id(self, name: str, expected: str) -> None:
-        assert AirflowSchedulerAdapter._to_dag_id(name) == expected
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("Daily Report", "daily_report"),
+            ("my-job-name", "my_job_name"),
+            ("UPPER CASE", "upper_case"),
+            ("already_valid", "already_valid"),
+        ],
+    )
+    def test_to_dag_id(self, adapter: AirflowSchedulerAdapter, name: str, expected: str) -> None:
+        # The fixture uses legacy dags_folder-only config where dag_id_prefix
+        # defaults to "" for backward compatibility, so the raw sanitized
+        # base IS the full dag_id.
+        assert adapter._to_dag_id(name) == expected
 
 
 class TestMapRunStatus:
-    @pytest.mark.parametrize("state,expected", [
-        ("success", RunStatus.SUCCESS),
-        ("failed", RunStatus.FAILED),
-        ("running", RunStatus.RUNNING),
-        ("queued", RunStatus.PENDING),
-        (None, RunStatus.UNKNOWN),
-        ("unknown_state", RunStatus.UNKNOWN),
-    ])
+    @pytest.mark.parametrize(
+        "state,expected",
+        [
+            ("success", RunStatus.SUCCESS),
+            ("failed", RunStatus.FAILED),
+            ("running", RunStatus.RUNNING),
+            ("queued", RunStatus.PENDING),
+            (None, RunStatus.UNKNOWN),
+            ("unknown_state", RunStatus.UNKNOWN),
+        ],
+    )
     def test_mapping(self, state: str, expected: RunStatus) -> None:
         assert _map_run_status(state) == expected
 
@@ -168,8 +194,10 @@ class TestMapRunStatus:
 class TestRegister:
     def test_register_adds_to_registry(self) -> None:
         from datus_scheduler_core.registry import SchedulerAdapterRegistry
+
         SchedulerAdapterRegistry.reset()
         import datus_scheduler_airflow
+
         datus_scheduler_airflow.register()
         assert SchedulerAdapterRegistry.is_registered("airflow")
         meta = SchedulerAdapterRegistry.get_metadata("airflow")
@@ -454,15 +482,15 @@ class TestSubmitJobMocked:
         with pytest.raises(SchedulerJobNotFoundError):
             adp.list_job_runs("nonexistent")
 
-    def test_to_dag_id_rejects_path_traversal(self) -> None:
+    def test_to_dag_id_rejects_path_traversal(self, adapter: AirflowSchedulerAdapter) -> None:
         """dag_id with path traversal characters must be rejected."""
         from datus_scheduler_core.exceptions import SchedulerException as _SE
 
         with pytest.raises(_SE, match="unsafe characters"):
-            AirflowSchedulerAdapter._to_dag_id("../etc/passwd")
+            adapter._to_dag_id("../etc/passwd")
 
         with pytest.raises(_SE, match="unsafe characters"):
-            AirflowSchedulerAdapter._to_dag_id("dag/with/slash")
+            adapter._to_dag_id("dag/with/slash")
 
 
 class TestSparkDagTemplate:
@@ -592,18 +620,28 @@ class TestDuckDBDagTemplate:
 
     def test_rendered_source_contains_duckdb_branch(self) -> None:
         source = render_dag_source(
-            dag_id="duckdb_dag", job_name="DuckDB Job", sql="SELECT 1",
+            dag_id="duckdb_dag",
+            job_name="DuckDB Job",
+            sql="SELECT 1",
             db_connection={"conn_id": "my_duckdb"},
-            schedule=None, start_date=None, end_date=None, description=None,
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         assert 'conn.conn_type == "duckdb"' in source
         assert "extra_dejson" in source
 
     def test_duckdb_conn_id_embedded(self) -> None:
         source = render_dag_source(
-            dag_id="d", job_name="d", sql="SELECT 1",
+            dag_id="d",
+            job_name="d",
+            sql="SELECT 1",
             db_connection={"conn_id": "duckdb_dacomp_lever"},
-            schedule=None, start_date=None, end_date=None, description=None,
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         assert "duckdb_dacomp_lever" in source
 
@@ -611,9 +649,14 @@ class TestDuckDBDagTemplate:
     def _call_resolve_url(conn_attrs: dict) -> str:
         """Render DAG, exec with mocked Airflow, and call _resolve_connection_url."""
         source = render_dag_source(
-            dag_id="test", job_name="test", sql="SELECT 1",
+            dag_id="test",
+            job_name="test",
+            sql="SELECT 1",
             db_connection={"conn_id": "test_conn"},
-            schedule=None, start_date=None, end_date=None, description=None,
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         conn_obj = SimpleNamespace(**conn_attrs)
         mock_base_hook = MagicMock()
@@ -632,80 +675,112 @@ class TestDuckDBDagTemplate:
             return ns["_resolve_connection_url"]({"conn_id": "test_conn"})
 
     def test_duckdb_absolute_path(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": "",
-            "host": "/opt/airflow/data/foo.duckdb", "extra_dejson": {},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "",
+                "host": "/opt/airflow/data/foo.duckdb",
+                "extra_dejson": {},
+            }
+        )
         assert url == "duckdb:////opt/airflow/data/foo.duckdb"
 
     def test_duckdb_relative_path(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": "local.db",
-            "host": "", "extra_dejson": {},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "local.db",
+                "host": "",
+                "extra_dejson": {},
+            }
+        )
         assert url == "duckdb:///local.db"
 
     def test_duckdb_memory(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": ":memory:",
-            "host": "", "extra_dejson": {},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": ":memory:",
+                "host": "",
+                "extra_dejson": {},
+            }
+        )
         assert url == "duckdb:///:memory:"
 
     def test_duckdb_query_params_preserved(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": "",
-            "host": "/opt/airflow/data/foo.duckdb",
-            "extra_dejson": {"read_only": "true"},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "",
+                "host": "/opt/airflow/data/foo.duckdb",
+                "extra_dejson": {"read_only": "true"},
+            }
+        )
         assert url == "duckdb:////opt/airflow/data/foo.duckdb?read_only=true"
 
     def test_duckdb_multiple_query_params(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": "",
-            "host": "/opt/airflow/data/foo.duckdb",
-            "extra_dejson": {"read_only": "true", "threads": "4"},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "",
+                "host": "/opt/airflow/data/foo.duckdb",
+                "extra_dejson": {"read_only": "true", "threads": "4"},
+            }
+        )
         assert "duckdb:////opt/airflow/data/foo.duckdb?" in url
         assert "read_only=true" in url
         assert "threads=4" in url
 
     def test_duckdb_no_query_params_no_question_mark(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": "",
-            "host": "/opt/airflow/data/foo.duckdb", "extra_dejson": {},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "",
+                "host": "/opt/airflow/data/foo.duckdb",
+                "extra_dejson": {},
+            }
+        )
         assert "?" not in url
 
     def test_duckdb_schema_takes_priority_over_host(self) -> None:
-        url = self._call_resolve_url({
-            "conn_type": "duckdb",
-            "schema": "/data/primary.duckdb",
-            "host": "/data/secondary.duckdb",
-            "extra_dejson": {},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "/data/primary.duckdb",
+                "host": "/data/secondary.duckdb",
+                "extra_dejson": {},
+            }
+        )
         assert url == "duckdb:////data/primary.duckdb"
 
     def test_duckdb_empty_path_raises(self) -> None:
         """Empty schema and host should raise, not produce ambiguous duckdb:///."""
         with pytest.raises(ValueError, match="no database path"):
-            self._call_resolve_url({
-                "conn_type": "duckdb", "schema": "",
-                "host": "", "extra_dejson": {},
-            })
+            self._call_resolve_url(
+                {
+                    "conn_type": "duckdb",
+                    "schema": "",
+                    "host": "",
+                    "extra_dejson": {},
+                }
+            )
 
     def test_duckdb_query_params_special_chars_encoded(self) -> None:
         """Reserved characters in extras must be percent-encoded."""
-        url = self._call_resolve_url({
-            "conn_type": "duckdb", "schema": "",
-            "host": "/data/foo.duckdb",
-            "extra_dejson": {"path": "/tmp/a b", "filter": "x=1&y=2"},
-        })
+        url = self._call_resolve_url(
+            {
+                "conn_type": "duckdb",
+                "schema": "",
+                "host": "/data/foo.duckdb",
+                "extra_dejson": {"path": "/tmp/a b", "filter": "x=1&y=2"},
+            }
+        )
         assert "duckdb:////data/foo.duckdb?" in url
         # Values must be percent-encoded, not raw
-        assert "a b" not in url        # space must be encoded
-        assert "x=1&y=2" not in url    # raw & must be encoded
+        assert "a b" not in url  # space must be encoded
+        assert "x=1&y=2" not in url  # raw & must be encoded
         from urllib.parse import parse_qs, urlparse
+
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         assert params["path"] == ["/tmp/a b"]
@@ -715,9 +790,14 @@ class TestDuckDBDagTemplate:
     def _call_resolve_url_with_conn(conn_obj) -> str:
         """Like _call_resolve_url but accepts a pre-built conn object."""
         source = render_dag_source(
-            dag_id="test", job_name="test", sql="SELECT 1",
+            dag_id="test",
+            job_name="test",
+            sql="SELECT 1",
             db_connection={"conn_id": "test_conn"},
-            schedule=None, start_date=None, end_date=None, description=None,
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
         )
         mock_base_hook = MagicMock()
         mock_base_hook.get_connection.return_value = conn_obj
@@ -749,3 +829,230 @@ class TestDuckDBDagTemplate:
         conn.get_uri.return_value = "mysql://user:pass@host:3306/mydb"
         url = self._call_resolve_url_with_conn(conn)
         assert url == "mysql://user:pass@host:3306/mydb"
+
+
+# ── Multi-tenant DAG folder tests ─────────────────────────────────────────
+
+
+class TestAirflowConfigMultiTenant:
+    """AirflowConfig validator behaviour for multi-tenant deployments."""
+
+    def _base_kwargs(self, **overrides: object) -> dict:
+        base = dict(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+        )
+        base.update(overrides)
+        return base
+
+    def test_resolves_from_root_and_project_name(self, tmp_path: Path) -> None:
+        cfg = AirflowConfig(
+            **self._base_kwargs(
+                dags_folder_root=str(tmp_path),
+                project_name="reports-team",
+            )
+        )
+        assert cfg.dags_folder == str(tmp_path / "reports-team")
+        # Hyphens sanitized in the prefix (dag_id must be [a-z0-9_])
+        assert cfg.dag_id_prefix == "reports_team__"
+
+    def test_env_var_fallback_for_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DATUS_AIRFLOW_DAGS_ROOT", str(tmp_path))
+        cfg = AirflowConfig(**self._base_kwargs(project_name="team-b"))
+        assert cfg.dags_folder == str(tmp_path / "team-b")
+        assert cfg.dag_id_prefix == "team_b__"
+
+    def test_mutual_exclusion_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="set either 'dags_folder'"):
+            AirflowConfig(
+                **self._base_kwargs(
+                    dags_folder=str(tmp_path),
+                    dags_folder_root=str(tmp_path / "other"),
+                    project_name="x",
+                )
+            )
+
+    def test_missing_project_name_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="project_name is required"):
+            AirflowConfig(**self._base_kwargs(dags_folder_root=str(tmp_path)))
+
+    def test_missing_all_paths_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DATUS_AIRFLOW_DAGS_ROOT", raising=False)
+        with pytest.raises(ValueError, match="requires one of"):
+            AirflowConfig(**self._base_kwargs(project_name="x"))
+
+    def test_legacy_dags_folder_still_works(self, tmp_path: Path) -> None:
+        """Backward-compat: old configs with only dags_folder keep working."""
+        cfg = AirflowConfig(**self._base_kwargs(dags_folder=str(tmp_path)))
+        assert cfg.dags_folder == str(tmp_path)
+        # With no project_name, prefix defaults to "" to preserve prior behavior
+        assert cfg.dag_id_prefix == ""
+
+    def test_explicit_empty_prefix_preserved(self, tmp_path: Path) -> None:
+        """Explicit '' means 'disable prefixing', not 'auto-derive'."""
+        cfg = AirflowConfig(
+            **self._base_kwargs(
+                dags_folder_root=str(tmp_path),
+                project_name="team-a",
+                dag_id_prefix="",
+            )
+        )
+        assert cfg.dag_id_prefix == ""
+
+    def test_explicit_custom_prefix_preserved(self, tmp_path: Path) -> None:
+        cfg = AirflowConfig(
+            **self._base_kwargs(
+                dags_folder_root=str(tmp_path),
+                project_name="team-a",
+                dag_id_prefix="custom_",
+            )
+        )
+        assert cfg.dag_id_prefix == "custom_"
+
+    def test_invalid_project_name_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="project_name"):
+            AirflowConfig(
+                **self._base_kwargs(
+                    dags_folder_root=str(tmp_path),
+                    project_name="bad/name",  # slash is not allowed
+                )
+            )
+
+    def test_invalid_dag_id_prefix_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="dag_id_prefix"):
+            AirflowConfig(
+                **self._base_kwargs(
+                    dags_folder=str(tmp_path),
+                    dag_id_prefix="Has-Caps-And-Hyphens",
+                )
+            )
+
+
+class TestAdapterMultiTenant:
+    """Adapter behaviour in multi-tenant mode."""
+
+    def _make_adapter(self, config: AirflowConfig) -> AirflowSchedulerAdapter:
+        with patch("datus_scheduler_airflow.adapter.httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value = MagicMock()
+            return AirflowSchedulerAdapter(config)
+
+    def test_init_creates_subdirectory(self, tmp_path: Path) -> None:
+        root = tmp_path / "dags"
+        assert not root.exists()
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder_root=str(root),
+            project_name="team-a",
+        )
+        self._make_adapter(cfg)
+        # {root}/team-a should have been created by _ensure_dags_folder
+        assert (root / "team-a").is_dir()
+
+    def test_init_fails_when_path_not_writable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If mkdir succeeds but os.access reports not writable, raise."""
+        from datus_scheduler_core.exceptions import SchedulerConnectionError
+
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder=str(tmp_path),
+        )
+        # Simulate a read-only mount by intercepting os.access at the symbol
+        # used by adapter.py. Using the dotted-path form keeps the patch
+        # resilient against import-style refactors in the module.
+        def fake_access(path: object, mode: int) -> bool:
+            return False
+
+        monkeypatch.setattr("datus_scheduler_airflow.adapter.os.access", fake_access)
+        with pytest.raises(SchedulerConnectionError, match="not writable"):
+            self._make_adapter(cfg)
+
+    def test_to_dag_id_applies_prefix(self, tmp_path: Path) -> None:
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder_root=str(tmp_path),
+            project_name="team-a",
+        )
+        adp = self._make_adapter(cfg)
+        assert adp._to_dag_id("daily sales") == "team_a__daily_sales"
+        assert adp._to_dag_id("Weekly Report") == "team_a__weekly_report"
+
+    def test_list_jobs_filters_by_prefix(self, tmp_path: Path) -> None:
+        """list_jobs must only return DAGs owned by this instance."""
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder_root=str(tmp_path),
+            project_name="team-a",
+        )
+        adp = self._make_adapter(cfg)
+
+        # Mock Airflow /dags response with DAGs from two tenants
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "dags": [
+                {"dag_id": "team_a__foo", "is_paused": False},
+                {"dag_id": "team_a__bar", "is_paused": False},
+                {"dag_id": "team_b__foo", "is_paused": False},  # other tenant
+                {"dag_id": "unrelated_legacy_dag", "is_paused": True},
+            ]
+        }
+        adp._session.get.return_value = resp
+
+        jobs = adp.list_jobs()
+
+        # Only the two team_a DAGs should come back
+        assert len(jobs) == 2
+        returned_ids = {j.job_id for j in jobs}
+        assert returned_ids == {"team_a__foo", "team_a__bar"}
+
+        # Adapter should have asked Airflow to narrow server-side too
+        call_kwargs = adp._session.get.call_args.kwargs
+        assert call_kwargs["params"]["dag_id_pattern"] == "team_a__"
+
+    def test_list_jobs_no_prefix_filter_in_legacy_mode(self, tmp_path: Path) -> None:
+        """Legacy dags_folder-only config should not filter list_jobs."""
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder=str(tmp_path),
+        )
+        adp = self._make_adapter(cfg)
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "dags": [
+                {"dag_id": "any_dag", "is_paused": False},
+                {"dag_id": "another", "is_paused": False},
+            ]
+        }
+        adp._session.get.return_value = resp
+
+        jobs = adp.list_jobs()
+        assert len(jobs) == 2
+
+        # No dag_id_pattern sent to Airflow
+        call_kwargs = adp._session.get.call_args.kwargs
+        assert "dag_id_pattern" not in call_kwargs["params"]

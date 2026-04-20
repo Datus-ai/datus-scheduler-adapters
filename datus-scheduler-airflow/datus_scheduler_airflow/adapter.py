@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-
 from datus_scheduler_core.base import BaseSchedulerAdapter
 from datus_scheduler_core.config import AirflowConfig
 from datus_scheduler_core.exceptions import (
@@ -92,25 +91,59 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
             timeout=config.timeout_seconds,
             headers={"Content-Type": "application/json"},
         )
+        self._ensure_dags_folder()
+
+    def _ensure_dags_folder(self) -> None:
+        """Create the per-instance dags_folder and verify writability.
+
+        In multi-tenant deployments, multiple Datus instances share the same
+        Airflow cluster via a common root directory (typically a JuiceFS / NFS
+        mount). Each instance owns a subdirectory derived from its
+        ``project_name``. Creating it on boot and verifying write access
+        means a misconfigured mount fails loudly at startup rather than
+        hours later on the first ``submit_job`` call.
+        """
+        path = Path(self._config.dags_folder)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except PermissionError as exc:
+            raise SchedulerConnectionError(
+                f"Cannot create dags_folder '{path}': permission denied. "
+                "Ensure the Datus process has write access to the parent "
+                "directory (typically via a shared fsGroup with the Airflow "
+                "scheduler pods)."
+            ) from exc
+        except OSError as exc:
+            raise SchedulerConnectionError(f"Cannot create dags_folder '{path}': {exc}") from exc
+        if not os.access(path, os.W_OK):
+            raise SchedulerConnectionError(f"dags_folder '{path}' is not writable by the current process.")
+        logger.info(
+            "Airflow adapter ready: dags_folder=%s, project_name=%r, dag_id_prefix=%r",
+            path,
+            self._config.project_name,
+            self._config.dag_id_prefix,
+        )
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
-    @staticmethod
-    def _to_dag_id(job_name: str) -> str:
+    def _to_dag_id(self, job_name: str) -> str:
         """Derive a valid Airflow dag_id from a job name.
 
-        Replaces spaces and hyphens with underscores and lowercases everything.
-        Raises ``SchedulerException`` if the result contains unsafe characters.
+        Replaces spaces and hyphens with underscores and lowercases everything,
+        then prepends ``config.dag_id_prefix`` (empty string disables prefixing).
+        Raises ``SchedulerException`` if the sanitized base contains unsafe
+        characters.
         """
         import re
 
-        dag_id = job_name.strip().lower().replace(" ", "_").replace("-", "_")
-        if not re.match(r"^[a-z0-9_\u4e00-\u9fff]+$", dag_id):
+        base = job_name.strip().lower().replace(" ", "_").replace("-", "_")
+        if not re.match(r"^[a-z0-9_\u4e00-\u9fff]+$", base):
             raise SchedulerException(
-                f"Invalid job_name '{job_name}': derived dag_id '{dag_id}' contains unsafe characters. "
+                f"Invalid job_name '{job_name}': derived dag_id '{base}' contains unsafe characters. "
                 "Only letters, digits, underscores, and CJK characters are allowed."
             )
-        return dag_id
+        prefix = self._config.dag_id_prefix or ""
+        return f"{prefix}{base}"
 
     def _dag_file_path(self, dag_id: str) -> Path:
         return Path(self._config.dags_folder) / f"{dag_id}.py"
@@ -227,8 +260,7 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         # Reject unsupported datus_command mode early
         if payload.datus_command and not payload.sql:
             raise SchedulerException(
-                "datus_command execution mode is not yet supported by AirflowSchedulerAdapter. "
-                "Use sql mode instead."
+                "datus_command execution mode is not yet supported by AirflowSchedulerAdapter. Use sql mode instead."
             )
 
         # Conflict detection
@@ -391,13 +423,19 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
                 break
             if resp.status_code == 400:
                 if attempt < 5:
-                    logger.debug("DELETE /dags/%s returned 400 (attempt %d), dag_bag may not be refreshed yet. Retrying in 5s…", job_id, attempt + 1)
+                    logger.debug(
+                        "DELETE /dags/%s returned 400 (attempt %d), dag_bag may not be refreshed yet. Retrying in 5s…",
+                        job_id,
+                        attempt + 1,
+                    )
                     time.sleep(5)
                     continue
                 else:
                     # dag_bag still has the entry after all retries, but the file is gone.
                     # The DAG cannot run again; accept this as a successful delete.
-                    logger.debug("DELETE /dags/%s returned 400 after all retries; DAG file removed, treating as deleted.", job_id)
+                    logger.debug(
+                        "DELETE /dags/%s returned 400 after all retries; DAG file removed, treating as deleted.", job_id
+                    )
                     delete_succeeded = True
                     break
             resp.raise_for_status()
@@ -491,18 +529,37 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
 
     def list_jobs(
         self,
-        project: Optional[str] = None,  # Airflow has no project concept; ignored
+        project: Optional[str] = None,  # Airflow has no native project concept; ignored
         status: Optional[JobStatus] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> List[ScheduledJob]:
+        """List DAGs registered in Airflow.
+
+        When ``config.dag_id_prefix`` is set (multi-tenant mode), results are
+        filtered to DAGs owned by this Datus instance. Airflow's
+        ``dag_id_pattern`` query parameter does substring matching, so we
+        combine server-side narrowing with client-side ``startswith`` to
+        avoid accidentally returning another tenant's DAG whose name happens
+        to contain this instance's prefix somewhere in the middle.
+        """
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
         if status == JobStatus.PAUSED:
             params["only_active"] = "false"
+
+        prefix = self._config.dag_id_prefix or ""
+        if prefix:
+            params["dag_id_pattern"] = prefix
+
         resp = self._session.get("/dags", params=params)
         resp.raise_for_status()
         data = resp.json()
-        jobs = [self._build_scheduled_job(d) for d in data.get("dags", [])]
+
+        raw_dags = data.get("dags", [])
+        if prefix:
+            raw_dags = [d for d in raw_dags if d.get("dag_id", "").startswith(prefix)]
+
+        jobs = [self._build_scheduled_job(d) for d in raw_dags]
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
         return jobs
@@ -541,9 +598,7 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
             return f"No task instances found for run {run_id}."
         task_id = task_instances[0]["task_id"]
         try_number = task_instances[0].get("try_number", 1)
-        log_resp = self._session.get(
-            f"/dags/{job_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}"
-        )
+        log_resp = self._session.get(f"/dags/{job_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}")
         log_resp.raise_for_status()
         return log_resp.text
 
