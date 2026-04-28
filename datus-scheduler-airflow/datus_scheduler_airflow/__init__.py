@@ -5,7 +5,7 @@ from datus_scheduler_core.config import AirflowConfig
 
 from datus_scheduler_airflow.adapter import AirflowSchedulerAdapter
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 __all__ = ["AirflowSchedulerAdapter", "AirflowConfig", "register"]
 
 
