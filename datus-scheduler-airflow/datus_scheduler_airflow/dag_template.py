@@ -87,6 +87,31 @@ _DAG_TEMPLATE = textwrap.dedent(
     _DATUS_CONFIG: dict = {config_json}
 
 
+    def _airflow_connection(db_connection: dict):
+        conn_id: str | None = db_connection.get("conn_id")
+        if not conn_id:
+            return None
+
+        from airflow.hooks.base import BaseHook  # noqa: PLC0415
+
+        return BaseHook.get_connection(conn_id)
+
+
+    def _connection_extra(conn) -> dict:
+        if conn is None:
+            return {{}}
+        extra = conn.extra_dejson if hasattr(conn, "extra_dejson") else {{}}
+        return extra or {{}}
+
+
+    def _is_duckdb_iceberg_connection(db_connection: dict) -> bool:
+        conn = _airflow_connection(db_connection)
+        extra = _connection_extra(conn)
+        executor = str(extra.get("datus_executor") or extra.get("executor") or "").lower()
+        conn_type = str(getattr(conn, "conn_type", "") or "").lower()
+        return executor == "duckdb_iceberg" or conn_type == "duckdb_iceberg"
+
+
     def _resolve_connection_url(db_connection: dict) -> str | None:
         """Resolve a SQLAlchemy connection URL from db_connection config.
 
@@ -96,9 +121,7 @@ _DAG_TEMPLATE = textwrap.dedent(
         """
         conn_id: str | None = db_connection.get("conn_id")
         if conn_id:
-            from airflow.hooks.base import BaseHook  # noqa: PLC0415
-
-            conn = BaseHook.get_connection(conn_id)
+            conn = _airflow_connection(db_connection)
             # DuckDB: Airflow round-trips the URI through component parsing,
             # which can corrupt "duckdb:///path".  Rebuild from conn fields.
             if conn.conn_type == "duckdb":
@@ -132,6 +155,223 @@ _DAG_TEMPLATE = textwrap.dedent(
         return db_connection.get("url")
 
 
+    def _load_duckdb_extension(conn, name: str) -> None:
+        try:
+            conn.execute("LOAD " + name)
+        except Exception:
+            conn.execute("INSTALL " + name)
+            conn.execute("LOAD " + name)
+
+
+    def _bool_extra(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {{"1", "true", "yes", "on"}}
+
+
+    def _quote_sql_literal(value: object) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+
+    def _safe_identifier(value: object, field_name: str) -> str:
+        import re  # noqa: PLC0415
+
+        text = str(value)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
+            raise ValueError("[Datus] Invalid " + field_name + ": " + text)
+        return text
+
+
+    def _sql_option(name: str, value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return name + " " + ("true" if value else "false")
+        return name + " " + _quote_sql_literal(value)
+
+
+    def _create_iceberg_secret_if_needed(con, extra: dict) -> str | None:  # noqa: ANN001
+        secret_name = extra.get("iceberg_secret_name") or extra.get("catalog_secret_name") or extra.get("secret_name")
+        create_secret = _bool_extra(extra.get("create_iceberg_secret"), default=True)
+        credential_keys = {{
+            "client_id",
+            "client_secret",
+            "oauth2_server_uri",
+            "oauth2_scope",
+            "oauth2_grant_type",
+            "token",
+        }}
+        has_credentials = any(extra.get(key) for key in credential_keys)
+        if not secret_name and has_credentials:
+            secret_name = "datus_iceberg"
+        if not secret_name:
+            return None
+
+        secret_name = _safe_identifier(secret_name, "iceberg_secret_name")
+        if not create_secret:
+            return secret_name
+
+        secret_option_map = {{
+            "client_id": "CLIENT_ID",
+            "client_secret": "CLIENT_SECRET",
+            "oauth2_server_uri": "OAUTH2_SERVER_URI",
+            "oauth2_scope": "OAUTH2_SCOPE",
+            "oauth2_grant_type": "OAUTH2_GRANT_TYPE",
+            "token": "TOKEN",
+        }}
+        secret_parts = ["TYPE iceberg"]
+        for cfg_key, sql_name in secret_option_map.items():
+            option = _sql_option(sql_name, extra.get(cfg_key))
+            if option:
+                secret_parts.append(option)
+        if len(secret_parts) == 1:
+            return secret_name
+
+        con.execute("CREATE OR REPLACE SECRET " + secret_name + " (" + ", ".join(secret_parts) + ")")
+        return secret_name
+
+
+    def _rewrite_iceberg_create_or_replace_table(sql: str) -> str:
+        import re  # noqa: PLC0415
+
+        pattern = re.compile(
+            r"CREATE\\s+OR\\s+REPLACE\\s+TABLE\\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\s+AS",
+            re.IGNORECASE,
+        )
+        return pattern.sub(
+            lambda match: "DROP TABLE IF EXISTS "
+            + match.group(1)
+            + ";\\nCREATE TABLE "
+            + match.group(1)
+            + " AS",
+            sql,
+        )
+
+
+    def _execute_duckdb_iceberg_sql(sql: str, db_connection: dict) -> dict:
+        conn = _airflow_connection(db_connection)
+        if conn is None:
+            raise ValueError("[Datus] duckdb_iceberg execution requires db_connection.conn_id")
+
+        extra = _connection_extra(conn)
+        catalog_alias = _safe_identifier(extra.get("catalog_alias") or "lake", "catalog_alias")
+        catalog_uri = extra.get("iceberg_catalog_uri") or extra.get("catalog_uri") or extra.get("endpoint")
+        warehouse = extra.get("warehouse")
+        if not catalog_uri:
+            raise ValueError("[Datus] duckdb_iceberg connection extra requires iceberg_catalog_uri")
+        if not warehouse:
+            raise ValueError("[Datus] duckdb_iceberg connection extra requires warehouse")
+
+        import duckdb  # noqa: PLC0415
+
+        con = duckdb.connect(":memory:")
+        try:
+            _load_duckdb_extension(con, "httpfs")
+            _load_duckdb_extension(con, "iceberg")
+
+            iceberg_secret_name = _create_iceberg_secret_if_needed(con, extra)
+
+            key_id = extra.get("s3_access_key_id") or extra.get("aws_access_key_id")
+            secret = extra.get("s3_secret_access_key") or extra.get("aws_secret_access_key")
+            region = extra.get("s3_region") or extra.get("aws_region") or "us-east-1"
+            provider = str(extra.get("s3_provider") or extra.get("aws_provider") or "").strip().lower()
+            endpoint = extra.get("s3_endpoint")
+            url_style = extra.get("s3_url_style") or extra.get("url_style")
+            use_ssl = _bool_extra(extra.get("s3_use_ssl"), default=not bool(endpoint))
+
+            if provider:
+                secret_parts = [
+                    "TYPE s3",
+                    "PROVIDER " + provider,
+                    "REGION " + _quote_sql_literal(region),
+                ]
+                if endpoint:
+                    endpoint_value = str(endpoint)
+                    endpoint_value = endpoint_value.removeprefix("http://").removeprefix("https://")
+                    secret_parts.append("ENDPOINT " + _quote_sql_literal(endpoint_value))
+                if url_style:
+                    secret_parts.append("URL_STYLE " + _quote_sql_literal(url_style))
+                secret_parts.append("USE_SSL " + ("true" if use_ssl else "false"))
+                con.execute("CREATE OR REPLACE SECRET datus_s3 (" + ", ".join(secret_parts) + ")")
+            elif key_id and secret:
+                secret_parts = [
+                    "TYPE s3",
+                    "KEY_ID " + _quote_sql_literal(key_id),
+                    "SECRET " + _quote_sql_literal(secret),
+                    "REGION " + _quote_sql_literal(region),
+                ]
+                if endpoint:
+                    endpoint_value = str(endpoint)
+                    endpoint_value = endpoint_value.removeprefix("http://").removeprefix("https://")
+                    secret_parts.append("ENDPOINT " + _quote_sql_literal(endpoint_value))
+                if url_style:
+                    secret_parts.append("URL_STYLE " + _quote_sql_literal(url_style))
+                secret_parts.append("USE_SSL " + ("true" if use_ssl else "false"))
+                con.execute("CREATE OR REPLACE SECRET datus_s3 (" + ", ".join(secret_parts) + ")")
+
+            attach_options = [
+                "TYPE iceberg",
+                "ENDPOINT " + _quote_sql_literal(catalog_uri),
+            ]
+            if iceberg_secret_name:
+                attach_options.append("SECRET " + iceberg_secret_name)
+
+            option_aliases = {{
+                "endpoint_type": "ENDPOINT_TYPE",
+                "default_region": "DEFAULT_REGION",
+                "authorization_type": "AUTHORIZATION_TYPE",
+                "access_delegation_mode": "ACCESS_DELEGATION_MODE",
+                "support_nested_namespaces": "SUPPORT_NESTED_NAMESPACES",
+                "support_stage_create": "SUPPORT_STAGE_CREATE",
+                "max_table_staleness": "MAX_TABLE_STALENESS",
+                "purge_requested": "PURGE_REQUESTED",
+            }}
+            has_catalog_auth = bool(
+                iceberg_secret_name
+                or extra.get("authorization_type")
+                or extra.get("endpoint_type")
+                or extra.get("client_id")
+                or extra.get("client_secret")
+                or extra.get("token")
+            )
+            if not has_catalog_auth:
+                if not extra.get("authorization_type"):
+                    attach_options.append("AUTHORIZATION_TYPE none")
+                if not extra.get("access_delegation_mode"):
+                    attach_options.append("ACCESS_DELEGATION_MODE none")
+            for cfg_key, sql_name in option_aliases.items():
+                option = _sql_option(sql_name, extra.get(cfg_key))
+                if option:
+                    attach_options.append(option)
+            attach_options.append(
+                "READ_ONLY " + ("true" if _bool_extra(extra.get("read_only"), default=False) else "false")
+            )
+            con.execute(
+                "ATTACH " + _quote_sql_literal(warehouse) + " AS " + catalog_alias + " ("
+                + ", ".join(attach_options)
+                + ")"
+            )
+
+            result = con.execute(_rewrite_iceberg_create_or_replace_table(sql))
+            if result.description:
+                columns = [col[0] for col in result.description]
+                rows = result.fetchmany(50)
+                print("[Datus] DuckDB Iceberg SQL completed. preview_rows=" + str(len(rows)))
+                if columns:
+                    print("[Datus] Columns: " + " | ".join(str(c) for c in columns))
+                for i, row in enumerate(rows):
+                    print("[Datus] Row " + str(i + 1) + ": " + " | ".join(str(v) for v in row))
+                return {{"status": "success", "row_count": len(rows)}}
+
+            print("[Datus] DuckDB Iceberg SQL completed.")
+            return {{"status": "success", "row_count": 0}}
+        finally:
+            con.close()
+
+
     def _execute_datus_sql(**context: dict) -> dict:  # noqa: ANN001
         """Execute the SQL configured by Datus."""
         cfg: dict = _DATUS_CONFIG
@@ -139,6 +379,9 @@ _DAG_TEMPLATE = textwrap.dedent(
         db_connection: dict = cfg.get("db_connection") or {{}}
 
         print("[Datus] Running SQL: " + sql[:200])
+
+        if _is_duckdb_iceberg_connection(db_connection):
+            return _execute_duckdb_iceberg_sql(sql, db_connection)
 
         connection_url: str | None = _resolve_connection_url(db_connection)
         if connection_url:
