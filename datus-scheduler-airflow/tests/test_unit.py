@@ -868,6 +868,20 @@ class TestDuckDBDagTemplate:
         assert 'conn.conn_type == "duckdb"' in source
         assert "extra_dejson" in source
 
+    def test_rendered_source_contains_duckdb_iceberg_branch(self) -> None:
+        source = render_dag_source(
+            dag_id="iceberg_dag",
+            job_name="Iceberg Job",
+            sql="SELECT 1",
+            db_connection={"conn_id": "lakehouse_demo"},
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
+        )
+        assert "duckdb_iceberg" in source
+        assert "_execute_duckdb_iceberg_sql" in source
+
     def test_duckdb_conn_id_embedded(self) -> None:
         source = render_dag_source(
             dag_id="d",
@@ -1065,6 +1079,259 @@ class TestDuckDBDagTemplate:
         conn.get_uri.return_value = "mysql://user:pass@host:3306/mydb"
         url = self._call_resolve_url_with_conn(conn)
         assert url == "mysql://user:pass@host:3306/mydb"
+
+    def test_duckdb_iceberg_connection_executes_with_duckdb(self) -> None:
+        source = render_dag_source(
+            dag_id="iceberg",
+            job_name="iceberg",
+            sql="CREATE TABLE lake.demo.t AS SELECT 1",
+            db_connection={"conn_id": "lakehouse_demo"},
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
+        )
+        conn = SimpleNamespace(
+            conn_type="generic",
+            extra_dejson={
+                "datus_executor": "duckdb_iceberg",
+                "catalog_alias": "lake",
+                "iceberg_catalog_uri": "http://iceberg-rest:8181",
+                "warehouse": "s3://warehouse/",
+                "s3_endpoint": "http://minio:9000",
+                "s3_access_key_id": "admin",
+                "s3_secret_access_key": "password",
+                "s3_url_style": "path",
+            },
+        )
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn
+
+        duckdb_conn = MagicMock()
+        duckdb_result = MagicMock()
+        duckdb_result.description = None
+        duckdb_conn.execute.return_value = duckdb_result
+        fake_duckdb = MagicMock()
+        fake_duckdb.connect.return_value = duckdb_conn
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+            "duckdb": fake_duckdb,
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            result = ns["_execute_datus_sql"]()
+
+        assert result == {"status": "success", "row_count": 0}
+        fake_duckdb.connect.assert_called_once_with(":memory:")
+        executed_sql = [call.args[0] for call in duckdb_conn.execute.call_args_list]
+        assert any("ATTACH 's3://warehouse/' AS lake" in sql for sql in executed_sql)
+        assert any("READ_ONLY false" in sql for sql in executed_sql)
+        assert "CREATE TABLE lake.demo.t AS SELECT 1" == executed_sql[-1]
+        assert "password" not in source
+
+    def test_duckdb_iceberg_rewrites_create_or_replace_table(self) -> None:
+        source = render_dag_source(
+            dag_id="iceberg",
+            job_name="iceberg",
+            sql="CREATE OR REPLACE TABLE lake.demo.t AS SELECT 1",
+            db_connection={"conn_id": "lakehouse_demo"},
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
+        )
+        conn = SimpleNamespace(
+            conn_type="generic",
+            extra_dejson={
+                "datus_executor": "duckdb_iceberg",
+                "catalog_alias": "lake",
+                "iceberg_catalog_uri": "http://iceberg-rest:8181",
+                "warehouse": "s3://warehouse/",
+            },
+        )
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn
+
+        duckdb_conn = MagicMock()
+        duckdb_result = MagicMock()
+        duckdb_result.description = None
+        duckdb_conn.execute.return_value = duckdb_result
+        fake_duckdb = MagicMock()
+        fake_duckdb.connect.return_value = duckdb_conn
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+            "duckdb": fake_duckdb,
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            result = ns["_execute_datus_sql"]()
+
+        assert result == {"status": "success", "row_count": 0}
+        executed_sql = [call.args[0] for call in duckdb_conn.execute.call_args_list]
+        assert executed_sql[-1] == "DROP TABLE IF EXISTS lake.demo.t;\nCREATE TABLE lake.demo.t AS SELECT 1"
+
+    def test_duckdb_iceberg_connection_supports_credential_chain(self) -> None:
+        source = render_dag_source(
+            dag_id="iceberg",
+            job_name="iceberg",
+            sql="SELECT 1",
+            db_connection={"conn_id": "lakehouse_demo"},
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
+        )
+        conn = SimpleNamespace(
+            conn_type="generic",
+            extra_dejson={
+                "datus_executor": "duckdb_iceberg",
+                "catalog_alias": "lake",
+                "iceberg_catalog_uri": "http://iceberg-rest:8181",
+                "warehouse": "s3://example-datus-demo/warehouse/",
+                "s3_provider": "credential_chain",
+                "s3_region": "us-east-1",
+            },
+        )
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn
+
+        duckdb_conn = MagicMock()
+        duckdb_result = MagicMock()
+        duckdb_result.description = None
+        duckdb_conn.execute.return_value = duckdb_result
+        fake_duckdb = MagicMock()
+        fake_duckdb.connect.return_value = duckdb_conn
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+            "duckdb": fake_duckdb,
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            result = ns["_execute_datus_sql"]()
+
+        assert result == {"status": "success", "row_count": 0}
+        executed_sql = [call.args[0] for call in duckdb_conn.execute.call_args_list]
+        secret_sql = next(sql for sql in executed_sql if "CREATE OR REPLACE SECRET datus_s3" in sql)
+        assert "PROVIDER credential_chain" in secret_sql
+        assert "REGION 'us-east-1'" in secret_sql
+        assert "USE_SSL true" in secret_sql
+        assert "KEY_ID" not in secret_sql
+        assert "SECRET '" not in secret_sql
+        assert any("ATTACH 's3://example-datus-demo/warehouse/' AS lake" in sql for sql in executed_sql)
+        assert executed_sql[-1] == "SELECT 1"
+
+    def test_duckdb_iceberg_connection_supports_oauth_secret(self) -> None:
+        source = render_dag_source(
+            dag_id="iceberg",
+            job_name="iceberg",
+            sql="SELECT 1",
+            db_connection={"conn_id": "lakehouse_user"},
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
+        )
+        conn = SimpleNamespace(
+            conn_type="generic",
+            extra_dejson={
+                "datus_executor": "duckdb_iceberg",
+                "catalog_alias": "lake",
+                "iceberg_catalog_uri": "https://catalog.example.com",
+                "warehouse": "public_catalog",
+                "client_id": "lakehouse_user",
+                "client_secret": "user-secret",
+                "oauth2_server_uri": "https://catalog.example.com/oauth/tokens",
+                "access_delegation_mode": "vended_credentials",
+            },
+        )
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn
+
+        duckdb_conn = MagicMock()
+        duckdb_result = MagicMock()
+        duckdb_result.description = None
+        duckdb_conn.execute.return_value = duckdb_result
+        fake_duckdb = MagicMock()
+        fake_duckdb.connect.return_value = duckdb_conn
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+            "duckdb": fake_duckdb,
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            result = ns["_execute_datus_sql"]()
+
+        assert result == {"status": "success", "row_count": 0}
+        executed_sql = [call.args[0] for call in duckdb_conn.execute.call_args_list]
+        secret_sql = next(sql for sql in executed_sql if "CREATE OR REPLACE SECRET datus_iceberg" in sql)
+        assert "TYPE iceberg" in secret_sql
+        assert "CLIENT_ID 'lakehouse_user'" in secret_sql
+        assert "CLIENT_SECRET 'user-secret'" in secret_sql
+        attach_sql = next(sql for sql in executed_sql if "ATTACH 'public_catalog' AS lake" in sql)
+        assert "SECRET datus_iceberg" in attach_sql
+        assert "ACCESS_DELEGATION_MODE 'vended_credentials'" in attach_sql
+        assert "AUTHORIZATION_TYPE none" not in attach_sql
+        assert "user-secret" not in source
+
+    def test_duckdb_iceberg_invalid_catalog_alias_rejected(self) -> None:
+        source = render_dag_source(
+            dag_id="iceberg",
+            job_name="iceberg",
+            sql="SELECT 1",
+            db_connection={"conn_id": "lakehouse_demo"},
+            schedule=None,
+            start_date=None,
+            end_date=None,
+            description=None,
+        )
+        conn = SimpleNamespace(
+            conn_type="generic",
+            extra_dejson={
+                "datus_executor": "duckdb_iceberg",
+                "catalog_alias": "bad-name",
+                "iceberg_catalog_uri": "http://iceberg-rest:8181",
+                "warehouse": "s3://warehouse/",
+            },
+        )
+        mock_base_hook = MagicMock()
+        mock_base_hook.get_connection.return_value = conn
+
+        airflow_mocks = {
+            "airflow": MagicMock(),
+            "airflow.hooks": MagicMock(),
+            "airflow.hooks.base": MagicMock(BaseHook=mock_base_hook),
+            "airflow.operators": MagicMock(),
+            "airflow.operators.python": MagicMock(),
+        }
+        ns: dict = {}
+        with patch.dict(sys.modules, airflow_mocks):
+            exec(compile(source, "<test>", "exec"), ns)  # noqa: S102
+            with pytest.raises(ValueError, match="catalog_alias"):
+                ns["_execute_datus_sql"]()
 
 
 # ── Multi-tenant DAG folder tests ─────────────────────────────────────────
