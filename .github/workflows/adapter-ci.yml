@@ -7,9 +7,6 @@ on:
       - synchronize
       - reopened
   merge_group:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 concurrency:
@@ -41,6 +38,7 @@ jobs:
         run: ci/run-unit-tests.sh
 
   integration-tests:
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     needs:
       - unit-tests
     runs-on: self-hosted
