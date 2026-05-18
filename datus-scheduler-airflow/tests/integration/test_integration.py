@@ -203,25 +203,41 @@ class TestTriggerJob:
             RunStatus.QUEUED if hasattr(RunStatus, "QUEUED") else RunStatus.PENDING,
         )
 
-    def test_trigger_and_wait_success(self, adapter: AirflowSchedulerAdapter, cleanup_dag: List[str]) -> None:
-        """Full end-to-end: submit → trigger → wait for terminal state."""
-        name = _unique_job_name("e2e")
+    def test_write_path_submit_trigger_poll_and_read_back(
+        self, adapter: AirflowSchedulerAdapter, cleanup_dag: List[str]
+    ) -> None:
+        """Full write-path contract: submit, trigger, poll, read back metadata/logs."""
+        name = _unique_job_name("write_path")
+        request_id = uuid.uuid4().hex
         payload = SchedulerJobPayload(
             job_name=name,
-            sql="SELECT 1 AS result",
+            sql="SELECT 1 AS write_path_value",
             db_connection={"url": "sqlite:///:memory:"},
             schedule=None,
-            description="E2E integration test",
+            description="Write-path integration test",
         )
         job = adapter.submit_job(payload)
         cleanup_dag.append(job.job_id)
 
-        run = adapter.trigger_job(job.job_id)
+        run = adapter.trigger_job(job.job_id, conf={"request_id": request_id})
         final_status = _wait_for_run_terminal(adapter, job.job_id, run.run_id, max_wait=120)
+
+        read_back = adapter.get_job_run(job.job_id, run.run_id)
+        run_history = adapter.list_job_runs(job.job_id, limit=10)
+        run_log = adapter.get_run_log(job.job_id, run.run_id)
 
         assert final_status == RunStatus.SUCCESS, (
             f"DAG run ended with {final_status!r} instead of SUCCESS. Check the Airflow logs for details."
         )
+        assert read_back is not None, "Expected get_job_run() to return the triggered run."
+        assert read_back.run_id == run.run_id
+        assert read_back.job_id == job.job_id
+        assert read_back.status == RunStatus.SUCCESS
+        if "conf" in read_back.extra:
+            assert read_back.extra["conf"].get("request_id") == request_id
+        assert any(history_run.run_id == run.run_id for history_run in run_history.items)
+        assert "[Datus] SQL completed. preview_rows=1" in run_log
+        assert "write_path_value" in run_log
 
 
 class TestListJobRuns:
