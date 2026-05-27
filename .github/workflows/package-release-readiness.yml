@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: "Workspace package to validate, for example one tool.uv.workspace member"
+        description: "Workspace adapter package to validate"
         required: true
-        type: string
+        type: choice
+        options:
+          - datus-scheduler-core
+          - datus-scheduler-airflow
       expected_version:
         description: "Expected package version, for example 0.1.5"
         required: true
