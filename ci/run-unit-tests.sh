@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 usage() {
   cat <<'USAGE'
-Usage: ci/run-unit-tests.sh [--list] [--dry-run]
+Usage: ci/run-unit-tests.sh [--list] [--dry-run] [package]
 
 Runs deterministic unit tests for the Airflow scheduler adapter.
 
@@ -26,6 +26,7 @@ require_command() {
 }
 
 dry_run=0
+requested_package=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -42,14 +43,24 @@ while [ "$#" -gt 0 ]; do
       exit 0
       ;;
     *)
-      echo "Unknown option: $1" >&2
-      usage >&2
-      exit 2
+      if [ -n "$requested_package" ]; then
+        echo "Only one package can be selected" >&2
+        usage >&2
+        exit 2
+      fi
+      requested_package="$1"
+      shift
       ;;
   esac
 done
 
 require_command uv
+
+if [ -n "$requested_package" ] && [ "$requested_package" != "datus-scheduler-airflow" ]; then
+  echo "Unknown package: $requested_package" >&2
+  usage >&2
+  exit 2
+fi
 
 if [ "$dry_run" -eq 1 ]; then
   echo "=== Unit tests: datus-scheduler-airflow ==="
