@@ -99,7 +99,7 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
             timeout=config.timeout_seconds,
             headers={"Content-Type": "application/json"},
         )
-        self._ensure_dags_folder()
+        self._dags_folder_verified = False
 
     def _ensure_dags_folder(self) -> None:
         """Create the per-instance dags_folder and verify writability.
@@ -107,10 +107,18 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         In multi-tenant deployments, multiple Datus instances share the same
         Airflow cluster via a common root directory (typically a JuiceFS / NFS
         mount). Each instance owns a subdirectory derived from its
-        ``project_name``. Creating it on boot and verifying write access
-        means a misconfigured mount fails loudly at startup rather than
-        hours later on the first ``submit_job`` call.
+        ``project_name``.
+
+        This is verified lazily, on the first filesystem write (DAG create /
+        update / delete), rather than in ``__init__``. Read-only operations
+        (``list_job_runs``, ``get_run_log``, ``list_jobs``, …) only call the
+        Airflow REST API and never touch ``dags_folder``; gating them on its
+        writability would make a transient first-time provisioning race (the
+        subdirectory briefly owned by another uid on the shared mount) surface
+        as a spurious failure on a pure read. The check runs once per adapter.
         """
+        if self._dags_folder_verified:
+            return
         path = Path(self._config.dags_folder)
         try:
             path.mkdir(parents=True, exist_ok=True)
@@ -143,6 +151,7 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
             except OSError as exc:
                 logger.warning("Failed to clean up write probe %s: %s", probe, exc)
 
+        self._dags_folder_verified = True
         logger.info(
             "Airflow adapter ready: dags_folder=%s, project_name=%r, dag_id_prefix=%r",
             path,
@@ -175,6 +184,7 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         return Path(self._config.dags_folder) / f"{dag_id}.py"
 
     def _write_dag_file(self, dag_id: str, source: str) -> None:
+        self._ensure_dags_folder()
         path = self._dag_file_path(dag_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -184,6 +194,7 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         logger.info("Wrote DAG file: %s", path)
 
     def _remove_dag_file(self, dag_id: str) -> None:
+        self._ensure_dags_folder()
         path = self._dag_file_path(dag_id)
         if path.exists():
             path.unlink()

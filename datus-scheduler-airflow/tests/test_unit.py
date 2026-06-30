@@ -359,6 +359,7 @@ class TestSubmitJobMocked:
         adp.api_base_url = config.api_base_url
         adp.timeout = config.timeout_seconds
         adp._session = MagicMock()
+        adp._dags_folder_verified = False
         return adp
 
     def test_submit_job_writes_dag_file(self, tmp_path: Path, sample_payload: SchedulerJobPayload) -> None:
@@ -1499,7 +1500,7 @@ class TestAdapterMultiTenant:
             mock_client_cls.return_value = MagicMock()
             return AirflowSchedulerAdapter(config)
 
-    def test_init_creates_subdirectory(self, tmp_path: Path) -> None:
+    def test_subdirectory_created_lazily_on_first_write(self, tmp_path: Path) -> None:
         root = tmp_path / "dags"
         assert not root.exists()
         cfg = AirflowConfig(
@@ -1511,18 +1512,25 @@ class TestAdapterMultiTenant:
             dags_folder_root=str(root),
             project_name="team-a",
         )
-        self._make_adapter(cfg)
-        # {root}/team-a should have been created by _ensure_dags_folder
-        assert (root / "team-a").is_dir()
+        adp = self._make_adapter(cfg)
+        # The probe is deferred: constructing the adapter must NOT touch disk,
+        # so read-only ops never depend on dags_folder being writable.
+        assert not (root / "team-a").exists()
 
-    def test_init_fails_when_path_not_writable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """mkdir succeeds but the actual write probe fails -> fail fast.
+        # The first filesystem write (DAG create) materializes the subdir.
+        adp._write_dag_file("team_a__foo", "# dag source")
+        assert (root / "team-a").is_dir()
+        assert (root / "team-a" / "team_a__foo.py").is_file()
+
+    def test_write_fails_when_path_not_writable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """mkdir succeeds but the actual write probe fails -> fail on write.
 
         Simulates a read-only NFS / JuiceFS mount where directory creation
         may succeed (via server permissions) but creating a file inside
         raises PermissionError. We target the probe's write_text call rather
         than os.access because os.access is advisory on networked filesystems
-        and the adapter no longer relies on it.
+        and the adapter no longer relies on it. The check is lazy, so the
+        failure surfaces on the first filesystem write, not at construction.
         """
         from datus_scheduler_core.exceptions import SchedulerConnectionError
 
@@ -1544,8 +1552,48 @@ class TestAdapterMultiTenant:
             return real_write_text(self, *args, **kwargs)
 
         monkeypatch.setattr("pathlib.Path.write_text", fake_write_text)
+        # Construction stays silent; only a write path triggers the probe.
+        adp = self._make_adapter(cfg)
         with pytest.raises(SchedulerConnectionError, match="not writable"):
-            self._make_adapter(cfg)
+            adp._write_dag_file("foo", "# dag source")
+
+    def test_read_op_does_not_require_writable_dags_folder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a read-only op (list_job_runs) must not run the write
+        probe. On a shared mount where the per-project subdir is briefly owned
+        by another uid, an eager probe turned pure reads into spurious
+        'dags_folder is not writable' failures.
+        """
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder_root=str(tmp_path),
+            project_name="team-a",
+            dag_id_prefix="team_a__",
+        )
+
+        real_write_text = Path.write_text
+
+        def fake_write_text(self: Path, *args: object, **kwargs: object) -> int:
+            if self.name.startswith(".datus_write_probe_"):
+                raise PermissionError("simulated read-only mount")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr("pathlib.Path.write_text", fake_write_text)
+        adp = self._make_adapter(cfg)
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"dag_runs": [], "total_entries": 0}
+        adp._session.get.return_value = resp
+
+        # Must not raise even though the dags_folder is not writable.
+        page = adp.list_job_runs("team_a__foo")
+        assert page.items == []
 
     def test_to_dag_id_applies_prefix(self, tmp_path: Path) -> None:
         cfg = AirflowConfig(
