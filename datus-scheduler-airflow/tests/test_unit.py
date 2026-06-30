@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from datus_scheduler_airflow import adapter as adapter_module
 from datus_scheduler_airflow.adapter import AirflowSchedulerAdapter, _map_run_status
 from datus_scheduler_airflow.dag_template import render_dag_source, render_spark_dag_source, render_sparksql_dag_source
 from datus_scheduler_core.config import AirflowConfig
@@ -1545,23 +1546,29 @@ class TestAdapterMultiTenant:
         )
 
         real_write_text = Path.write_text
+        delays: list[float] = []
 
         def fake_write_text(self: Path, *args: object, **kwargs: object) -> int:
             # Intercept only the probe, leave everything else alone. A real
-            # read-only mount keeps failing on every attempt, so the single
-            # transient retry exhausts and the probe still raises.
+            # read-only mount keeps failing on every attempt, so the backoff
+            # is exhausted and the probe still raises.
             if self.name.startswith(".datus_write_probe_"):
                 raise PermissionError(errno.EACCES, "simulated read-only mount")
             return real_write_text(self, *args, **kwargs)
 
         monkeypatch.setattr("pathlib.Path.write_text", fake_write_text)
-        monkeypatch.setattr("datus_scheduler_airflow.adapter.time.sleep", lambda _s: None)
+        monkeypatch.setattr("datus_scheduler_airflow.adapter.time.sleep", lambda s: delays.append(s))
         # Construction stays silent; only a write path triggers the probe.
         adp = self._make_adapter(cfg)
         with pytest.raises(SchedulerConnectionError, match="not writable"):
             adp._write_dag_file("foo", "# dag source")
 
-    def test_write_probe_retries_once_on_transient_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The full backoff is walked before giving up, and it spans past the
+        # JuiceFS attr-cache TTL (>=1s) so the last attempt is post-TTL.
+        assert delays == list(adapter_module._WRITE_PROBE_RETRY_BACKOFF_S)
+        assert sum(delays) >= 1.0
+
+    def test_write_probe_retries_on_transient_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A transient EPERM on the first probe (stale JuiceFS attr cache right
         after mkdir) must be retried, not amplified into a scheduler failure.
         """

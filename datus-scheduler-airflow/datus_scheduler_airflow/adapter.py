@@ -57,7 +57,11 @@ logger = logging.getLogger(__name__)
 # a genuinely read-only mount keeps returning them, a full disk (ENOSPC)
 # would not be helped by a retry.
 _WRITE_PROBE_RETRY_ERRNOS = frozenset({errno.EPERM, errno.EACCES})
-_WRITE_PROBE_RETRY_DELAY_S = 0.2
+# Backoff between probe attempts. JuiceFS's --attr-cache default TTL is 1s,
+# so a single sub-second retry can land in the same stale window and fail
+# again. The schedule must span past 1s to guarantee a post-TTL attempt;
+# cumulative wait here is 1.7s (0.2 + 0.5 + 1.0) across 4 total attempts.
+_WRITE_PROBE_RETRY_BACKOFF_S = (0.2, 0.5, 1.0)
 
 # Airflow state → RunStatus mapping
 _AIRFLOW_STATE_MAP: Dict[str, RunStatus] = {
@@ -146,14 +150,15 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
         # fails loudly. The probe name starts with a dot so it is invisible
         # to Airflow's DAG scanner even if cleanup is interrupted.
         #
-        # Retry once on a transient EPERM/EACCES: when several backend
-        # replicas share one JuiceFS mount, the replica that just created
-        # the directory can hit a stale attr cache on the immediately
-        # following write. A single transient hiccup must not be amplified
-        # into a full scheduler failure, so we re-probe after a short pause
-        # before declaring the mount unwritable.
+        # Retry on a transient EPERM/EACCES: when several backend replicas
+        # share one JuiceFS mount, the replica that just created the directory
+        # can hit a stale attr cache on the immediately following write. A
+        # single transient hiccup must not be amplified into a full scheduler
+        # failure, so we re-probe with a backoff that spans past the attr-cache
+        # TTL before declaring the mount unwritable.
         last_exc: Optional[OSError] = None
-        for attempt in range(2):
+        max_attempts = len(_WRITE_PROBE_RETRY_BACKOFF_S) + 1
+        for attempt in range(max_attempts):
             probe = path / f".datus_write_probe_{os.getpid()}_{attempt}"
             try:
                 probe.write_text("")
@@ -161,14 +166,17 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
                 break
             except OSError as exc:
                 last_exc = exc
-                if attempt == 0 and exc.errno in _WRITE_PROBE_RETRY_ERRNOS:
+                if attempt < len(_WRITE_PROBE_RETRY_BACKOFF_S) and exc.errno in _WRITE_PROBE_RETRY_ERRNOS:
+                    delay = _WRITE_PROBE_RETRY_BACKOFF_S[attempt]
                     logger.warning(
-                        "Write probe on '%s' hit a transient %s; retrying once after %.1fs",
+                        "Write probe on '%s' hit a transient %s; retry %d/%d after %.1fs",
                         path,
                         errno.errorcode.get(exc.errno, exc.errno),
-                        _WRITE_PROBE_RETRY_DELAY_S,
+                        attempt + 1,
+                        len(_WRITE_PROBE_RETRY_BACKOFF_S),
+                        delay,
                     )
-                    time.sleep(_WRITE_PROBE_RETRY_DELAY_S)
+                    time.sleep(delay)
                     continue
                 break
             finally:
