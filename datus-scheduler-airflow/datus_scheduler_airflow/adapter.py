@@ -20,6 +20,7 @@ Airflow-specific notes
   e.g. ``http://localhost:8080/api/v1``.
 """
 
+import errno
 import logging
 import os
 import time
@@ -49,6 +50,14 @@ from datus_scheduler_core.models import (
 from datus_scheduler_airflow.dag_template import render_dag_source, render_spark_dag_source, render_sparksql_dag_source
 
 logger = logging.getLogger(__name__)
+
+# A freshly created dir on JuiceFS/NFS can briefly report EPERM/EACCES on a
+# write while the kernel's attr cache for it is stale (default_permissions
+# checks the cached owner/mode). These are the only errnos worth retrying;
+# a genuinely read-only mount keeps returning them, a full disk (ENOSPC)
+# would not be helped by a retry.
+_WRITE_PROBE_RETRY_ERRNOS = frozenset({errno.EPERM, errno.EACCES})
+_WRITE_PROBE_RETRY_DELAY_S = 0.2
 
 # Airflow state → RunStatus mapping
 _AIRFLOW_STATE_MAP: Dict[str, RunStatus] = {
@@ -134,22 +143,45 @@ class AirflowSchedulerAdapter(BaseSchedulerAdapter):
 
         # os.access is advisory on NFS / JuiceFS and can lie in either
         # direction. Perform a real write probe so a misconfigured mount
-        # fails loudly at boot. The probe name starts with a dot so it is
-        # invisible to Airflow's DAG scanner even if cleanup is interrupted.
-        probe = path / f".datus_write_probe_{os.getpid()}"
-        try:
-            probe.write_text("")
-        except OSError as exc:
-            raise SchedulerConnectionError(
-                f"dags_folder '{path}' is not writable by the current process: {exc}"
-            ) from exc
-        finally:
+        # fails loudly. The probe name starts with a dot so it is invisible
+        # to Airflow's DAG scanner even if cleanup is interrupted.
+        #
+        # Retry once on a transient EPERM/EACCES: when several backend
+        # replicas share one JuiceFS mount, the replica that just created
+        # the directory can hit a stale attr cache on the immediately
+        # following write. A single transient hiccup must not be amplified
+        # into a full scheduler failure, so we re-probe after a short pause
+        # before declaring the mount unwritable.
+        last_exc: Optional[OSError] = None
+        for attempt in range(2):
+            probe = path / f".datus_write_probe_{os.getpid()}_{attempt}"
             try:
-                probe.unlink()
-            except FileNotFoundError:
-                pass
+                probe.write_text("")
+                last_exc = None
+                break
             except OSError as exc:
-                logger.warning("Failed to clean up write probe %s: %s", probe, exc)
+                last_exc = exc
+                if attempt == 0 and exc.errno in _WRITE_PROBE_RETRY_ERRNOS:
+                    logger.warning(
+                        "Write probe on '%s' hit a transient %s; retrying once after %.1fs",
+                        path,
+                        errno.errorcode.get(exc.errno, exc.errno),
+                        _WRITE_PROBE_RETRY_DELAY_S,
+                    )
+                    time.sleep(_WRITE_PROBE_RETRY_DELAY_S)
+                    continue
+                break
+            finally:
+                try:
+                    probe.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning("Failed to clean up write probe %s: %s", probe, exc)
+        if last_exc is not None:
+            raise SchedulerConnectionError(
+                f"dags_folder '{path}' is not writable by the current process: {last_exc}"
+            ) from last_exc
 
         self._dags_folder_verified = True
         logger.info(

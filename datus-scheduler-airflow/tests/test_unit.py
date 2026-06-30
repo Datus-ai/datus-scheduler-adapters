@@ -3,6 +3,7 @@
 
 """Unit tests for datus-airflow adapter (no live Airflow required)."""
 
+import errno
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1546,16 +1547,53 @@ class TestAdapterMultiTenant:
         real_write_text = Path.write_text
 
         def fake_write_text(self: Path, *args: object, **kwargs: object) -> int:
-            # Intercept only the probe, leave everything else alone.
+            # Intercept only the probe, leave everything else alone. A real
+            # read-only mount keeps failing on every attempt, so the single
+            # transient retry exhausts and the probe still raises.
             if self.name.startswith(".datus_write_probe_"):
-                raise PermissionError("simulated read-only mount")
+                raise PermissionError(errno.EACCES, "simulated read-only mount")
             return real_write_text(self, *args, **kwargs)
 
         monkeypatch.setattr("pathlib.Path.write_text", fake_write_text)
+        monkeypatch.setattr("datus_scheduler_airflow.adapter.time.sleep", lambda _s: None)
         # Construction stays silent; only a write path triggers the probe.
         adp = self._make_adapter(cfg)
         with pytest.raises(SchedulerConnectionError, match="not writable"):
             adp._write_dag_file("foo", "# dag source")
+
+    def test_write_probe_retries_once_on_transient_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A transient EPERM on the first probe (stale JuiceFS attr cache right
+        after mkdir) must be retried, not amplified into a scheduler failure.
+        """
+        cfg = AirflowConfig(
+            name="t",
+            type="airflow",
+            api_base_url="http://localhost:8080/api/v1",
+            username="admin",
+            password="admin",
+            dags_folder=str(tmp_path),
+        )
+
+        real_write_text = Path.write_text
+        attempts: list[str] = []
+
+        def fake_write_text(self: Path, *args: object, **kwargs: object) -> int:
+            if self.name.startswith(".datus_write_probe_"):
+                attempts.append(self.name)
+                # Fail only the first attempt (suffix "_0"); let the retry pass.
+                if self.name.endswith("_0"):
+                    raise PermissionError(errno.EPERM, "stale attr cache")
+                return real_write_text(self, *args, **kwargs)
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr("pathlib.Path.write_text", fake_write_text)
+        monkeypatch.setattr("datus_scheduler_airflow.adapter.time.sleep", lambda _s: None)
+        adp = self._make_adapter(cfg)
+
+        # Must not raise; the second probe attempt succeeds.
+        adp._ensure_dags_folder()
+        assert adp._dags_folder_verified is True
+        assert len(attempts) == 2
 
     def test_read_op_does_not_require_writable_dags_folder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
