@@ -26,6 +26,7 @@ require_command() {
 }
 
 PACKAGE_SPECS=(
+  "datus-scheduler-core:datus-scheduler-core/tests/test_unit.py"
   "datus-scheduler-airflow:datus-scheduler-airflow/tests/test_unit.py"
 )
 
