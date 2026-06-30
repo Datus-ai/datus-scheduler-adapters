@@ -89,8 +89,30 @@ should_run_package() {
   return 1
 }
 
+is_configured_package() {
+  local requested="$1"
+  local spec package
+  for spec in "${PACKAGE_SPECS[@]}"; do
+    package="${spec%%:*}"
+    if [ "$package" = "$requested" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "${#requested_packages[@]}" -gt 0 ]; then
+  for requested in "${requested_packages[@]}"; do
+    if ! is_configured_package "$requested"; then
+      echo "No configured unit-test target for package: $requested" >&2
+      exit 2
+    fi
+  done
+fi
+
 require_command uv
 
+selected_count=0
 for spec in "${PACKAGE_SPECS[@]}"; do
   package="${spec%%:*}"
   test_path="${spec#*:}"
@@ -98,6 +120,7 @@ for spec in "${PACKAGE_SPECS[@]}"; do
   if ! should_run_package "$package"; then
     continue
   fi
+  selected_count=$((selected_count + 1))
 
   echo ""
   echo "=== Unit tests: $package ==="
@@ -112,3 +135,8 @@ for spec in "${PACKAGE_SPECS[@]}"; do
     --tb=short \
     --verbose
 done
+
+if [ "$selected_count" -eq 0 ]; then
+  echo "No unit-test targets selected." >&2
+  exit 2
+fi
